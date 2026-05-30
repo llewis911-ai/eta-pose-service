@@ -16,7 +16,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-mp_pose = mp.solutions.pose
+mp_pose = none
 
 LANDMARK_NAMES = {
     0: "nose", 1: "left_eye_inner", 2: "left_eye", 3: "left_eye_outer",
