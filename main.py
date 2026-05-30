@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import mediapipe as mp
 import numpy as np
 import base64
 import cv2
 import math
+from typing import Any
 
 app = FastAPI(title="ETA Pose Analysis Service")
 
@@ -31,7 +31,6 @@ LANDMARK_NAMES = {
 }
 
 def angle_between(a, b, c):
-    """Calculate angle at point b between points a-b-c."""
     try:
         ba = [a[0] - b[0], a[1] - b[1]]
         bc = [c[0] - b[0], c[1] - b[1]]
@@ -43,20 +42,17 @@ def angle_between(a, b, c):
         return None
 
 def extract_sprint_metrics(landmarks, image_width, image_height):
-    """Extract key sprint biomechanics from pose landmarks."""
     def lm(idx):
         l = landmarks[idx]
         return [l.x * image_width, l.y * image_height] if l.visibility > 0.5 else None
 
     metrics = {}
 
-    # Joint angles
     l_hip = lm(23); l_knee = lm(25); l_ankle = lm(27)
     r_hip = lm(24); r_knee = lm(26); r_ankle = lm(28)
     l_shoulder = lm(11); r_shoulder = lm(12)
     l_elbow = lm(13); r_elbow = lm(14)
     l_wrist = lm(15); r_wrist = lm(16)
-    nose = lm(0)
 
     if l_hip and l_knee and l_ankle:
         metrics["left_knee_angle"] = angle_between(l_hip, l_knee, l_ankle)
@@ -67,12 +63,10 @@ def extract_sprint_metrics(landmarks, image_width, image_height):
     if r_shoulder and r_elbow and r_wrist:
         metrics["right_elbow_angle"] = angle_between(r_shoulder, r_elbow, r_wrist)
 
-    # Hip height (normalized 0-1, higher = better for sprinting)
     if l_hip and r_hip:
         avg_hip_y = (l_hip[1] + r_hip[1]) / 2
         metrics["hip_height_normalized"] = round(1 - (avg_hip_y / image_height), 3)
 
-    # Forward lean angle (trunk inclination)
     if l_shoulder and r_shoulder and l_hip and r_hip:
         mid_shoulder = [(l_shoulder[0]+r_shoulder[0])/2, (l_shoulder[1]+r_shoulder[1])/2]
         mid_hip = [(l_hip[0]+r_hip[0])/2, (l_hip[1]+r_hip[1])/2]
@@ -80,12 +74,10 @@ def extract_sprint_metrics(landmarks, image_width, image_height):
         dy = mid_hip[1] - mid_shoulder[1]
         metrics["trunk_lean_angle"] = round(math.degrees(math.atan2(dx, dy + 1e-6)), 1)
 
-    # Stride width (lateral separation of feet)
     l_foot = lm(31); r_foot = lm(32)
     if l_foot and r_foot:
         metrics["stride_width_px"] = round(abs(l_foot[0] - r_foot[0]), 1)
 
-    # Arm drive symmetry
     if l_elbow and r_elbow and l_hip and r_hip:
         mid_hip_y = (l_hip[1] + r_hip[1]) / 2
         l_arm_drive = mid_hip_y - l_elbow[1]
@@ -95,7 +87,6 @@ def extract_sprint_metrics(landmarks, image_width, image_height):
                 min(l_arm_drive, r_arm_drive) / max(l_arm_drive, r_arm_drive + 1e-6), 3
             )
 
-    # Knee drive height (lead knee relative to hip)
     if l_knee and r_knee and l_hip and r_hip:
         mid_hip_y = (l_hip[1] + r_hip[1]) / 2
         higher_knee_y = min(l_knee[1], r_knee[1])
@@ -103,11 +94,9 @@ def extract_sprint_metrics(landmarks, image_width, image_height):
 
     return metrics
 
-def compute_form_score(metrics, joint_angles_raw):
-    """Compute 0-100 form score from biomechanics metrics."""
-    score = 60  # baseline
+def compute_form_score(metrics):
+    score = 60
 
-    # Knee angle: ideal sprint knee drive = 90-130 degrees
     for side in ["left_knee_angle", "right_knee_angle"]:
         angle = metrics.get(side)
         if angle:
@@ -116,14 +105,12 @@ def compute_form_score(metrics, joint_angles_raw):
             elif angle < 70 or angle > 160:
                 score -= 5
 
-    # Hip height: higher is better (>0.5 normalized)
     hip_h = metrics.get("hip_height_normalized", 0)
     if hip_h > 0.55:
         score += 8
     elif hip_h < 0.4:
         score -= 8
 
-    # Trunk lean: ideal 5-15 degrees forward
     lean = metrics.get("trunk_lean_angle")
     if lean is not None:
         if 5 <= lean <= 20:
@@ -131,7 +118,6 @@ def compute_form_score(metrics, joint_angles_raw):
         elif lean > 30 or lean < -5:
             score -= 6
 
-    # Arm symmetry: closer to 1.0 = more symmetric
     arm_sym = metrics.get("arm_symmetry")
     if arm_sym is not None:
         if arm_sym > 0.8:
@@ -139,7 +125,6 @@ def compute_form_score(metrics, joint_angles_raw):
         elif arm_sym < 0.5:
             score -= 5
 
-    # Knee drive ratio
     knee_drive = metrics.get("knee_drive_ratio", 0)
     if knee_drive > 0.08:
         score += 6
@@ -148,28 +133,18 @@ def compute_form_score(metrics, joint_angles_raw):
 
     return max(0, min(100, round(score)))
 
-class AnalyzeRequest(BaseModel):
-    image_base64: str
-    athlete_name: str = "Athlete"
-    event: str = "100m"
-    phase: str = "full"
-
-class AnalyzeResponse(BaseModel):
-    success: bool
-    keypoints: dict
-    metrics: dict
-    form_score: int
-    error: str = None
-
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "ETA Pose Analysis"}
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(req: AnalyzeRequest):
+@app.post("/analyze")
+async def analyze(req: dict[str, Any]):
     try:
-        # Decode base64 image
-        img_data = base64.b64decode(req.image_base64)
+        image_base64 = req.get("image_base64", "")
+        if not image_base64:
+            raise HTTPException(status_code=400, detail="image_base64 is required")
+
+        img_data = base64.b64decode(image_base64)
         np_arr = np.frombuffer(img_data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if image is None:
@@ -178,7 +153,6 @@ async def analyze(req: AnalyzeRequest):
         h, w = image.shape[:2]
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Run MediaPipe Pose
         with mp_pose.Pose(
             static_image_mode=True,
             model_complexity=2,
@@ -188,15 +162,14 @@ async def analyze(req: AnalyzeRequest):
             results = pose.process(image_rgb)
 
         if not results.pose_landmarks:
-            return AnalyzeResponse(
-                success=False,
-                keypoints={},
-                metrics={},
-                form_score=0,
-                error="No pose detected in image. Ensure the athlete's full body is visible."
-            )
+            return {
+                "success": False,
+                "keypoints": {},
+                "metrics": {},
+                "form_score": 0,
+                "error": "No pose detected. Ensure the athlete's full body is visible."
+            }
 
-        # Extract keypoints
         landmarks = results.pose_landmarks.landmark
         keypoints = {}
         for idx, name in LANDMARK_NAMES.items():
@@ -208,18 +181,16 @@ async def analyze(req: AnalyzeRequest):
                 "visibility": round(lm.visibility, 3),
             }
 
-        # Extract sprint metrics
         metrics = extract_sprint_metrics(landmarks, w, h)
+        form_score = compute_form_score(metrics)
 
-        # Compute form score
-        form_score = compute_form_score(metrics, keypoints)
-
-        return AnalyzeResponse(
-            success=True,
-            keypoints=keypoints,
-            metrics=metrics,
-            form_score=form_score,
-        )
+        return {
+            "success": True,
+            "keypoints": keypoints,
+            "metrics": metrics,
+            "form_score": form_score,
+            "error": None
+        }
 
     except HTTPException:
         raise
